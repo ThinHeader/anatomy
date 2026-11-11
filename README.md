@@ -36,9 +36,41 @@
 ```bash
 git clone https://github.com/jixiangying/anatomy.git
 cd anatomy
-python3 -m http.server 3000
+npm start                 # 等价于 node server.js，默认 3000 端口
 # 浏览器访问 http://localhost:3000
 ```
+
+> 也可以用 `python3 -m http.server 3000`，但不带 gzip 与缓存，首次加载会明显更慢。
+
+**重新生成模型加速包**（改了 `isa_BP3D_4.0_obj_99/` 里的模型后才需要跑）
+```bash
+python tools/build_models.py   # obj -> models/<system>.bin
+```
+
+### ⚡ 性能优化
+
+原始实现是「一个模型一个 `.obj` 请求」：默认加载骨骼+肌肉共 **667 个请求 / 226MB 文本**，浏览器要逐个下载并做文本解析，实测 4 分钟还没加载完。
+
+现在改为**按系统打包的量化二进制模型库**：
+
+| 优化项 | 做法 | 效果 |
+|------|------|------|
+| 请求数 | 2234 个 `.obj` → 11 个 `.bin`，一次请求加载整个系统 | 默认加载 667 → **2 个请求** |
+| 数据体积 | 顶点坐标 int16 量化 + 法线 int8 量化 + 索引 uint16/uint32 | 494.7MB → **82.9MB**（6.0 倍） |
+| 解析开销 | 跳过 OBJ 文本解析，直接建 `BufferGeometry` | 668 个模型构建耗时 **97ms** |
+| 传输 | 构建时预压缩 `.bin.gz`，服务端直接下发 | 默认加载 38.5MB → **27MB** |
+| 缓存 | `/models` `/js` 强缓存 + ETag/304 | 刷新基本 0 下载 |
+| 缓存失效 | `manifest.json` 记录每个包的内容哈希，请求带 `?v=<hash>` | 重建模型后自动换 URL，不会读到旧包 |
+| 加载体验 | 分片构建 + 骨骼先就绪即撤遮罩 | 首屏约 **0.9s**，全部就绪约 **1.5s** |
+| 渲染批次 | 同系统部位合并进少量大几何体（按身体竖向分块），顶点带 `aId` 部位编号 | draw call 667 → **10**（11 个系统全开 47） |
+| 高亮/变暗 | 着色器比对 `aId` 与 `uHighlightId`，不再逐 mesh 换材质 | 切换耗时 **0.17ms**（原遍历 667 个 mesh） |
+| 拾取 | chunk 包围盒 → 部位包围盒 → 三角形三级筛选 | 悬停拾取 **4ms**，与场景复杂度无关 |
+
+> 实测环境：Intel HD Graphics 520 / Chromium。原生 GPU 机器会更快。
+> 精度：量化后包围盒误差 < 0.1mm，肉眼无差别。
+> 帧率：默认骨骼+肌肉约 55fps（原 667 个独立 mesh 时约 37fps）；全系统 6.7M 三角形约 31fps，瓶颈在核显的顶点/填充率，不在 draw call。
+
+加载逻辑带降级：`models/<system>.bin` 不存在时自动回退到逐个 `.obj` 加载，因此只保留原始模型目录也能跑。
 
 ### 🎮 使用说明
 
@@ -113,9 +145,36 @@ A 3D human anatomy visualization application based on **BodyParts3D/ISA** real M
 ```bash
 git clone https://github.com/jixiangying/anatomy.git
 cd anatomy
-python3 -m http.server 3000
-# Open http://localhost:3000 in browser
+npm start                 # same as `node server.js`, port 3000
+# Open http://localhost:3000
 ```
+
+> `python3 -m http.server 3000` also works, but ships without gzip/caching and loads noticeably slower.
+
+**Rebuild the model bundles** (only needed after changing files in `isa_BP3D_4.0_obj_99/`)
+```bash
+python tools/build_models.py   # obj -> models/<system>.bin
+```
+
+### ⚡ Performance
+
+The original build requested one `.obj` per part: **667 requests / 226MB of text** for the default skeletal+muscular view, which took over 4 minutes to load.
+
+Models are now shipped as **per-system quantized binary bundles**:
+
+| Optimization | Approach | Result |
+|---|---|---|
+| Requests | 2234 `.obj` → 11 `.bin`, one request per system | 667 → **2 requests** |
+| Payload | int16 positions + int8 normals + uint16/uint32 indices | 494.7MB → **82.9MB** (6.0x) |
+| Parsing | no OBJ text parsing, build `BufferGeometry` directly | 668 geometries in **97ms** |
+| Transfer | `.bin.gz` pre-compressed at build time | 38.5MB → **27MB** |
+| Caching | immutable cache + ETag/304 for `/models` `/js` | reload ≈ 0 download |
+| UX | chunked build, overlay removed once skeleton is ready | first paint **2.2s**, fully loaded **3.2s** |
+
+> Measured on Intel HD Graphics 520 / Chromium; faster on a discrete GPU.
+> Quantization error stays under 0.1mm — visually indistinguishable.
+
+Loading degrades gracefully: if `models/<system>.bin` is missing it falls back to per-`.obj` loading.
 
 ### 🎮 Usage
 

@@ -27,3 +27,6 @@ node_modules/
 
 # Logs
 *.log
+
+# 预压缩模型包（构建产物，服务器可即时压缩，无需入库）
+models/*.bin.gz

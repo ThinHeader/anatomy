@@ -1,0 +1,10 @@
+{
+  "name": "anatomy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "人体解剖学 3D 交互图谱 (BodyParts3D / ISA)",
+  "scripts": {
+    "start": "node server.js",
+    "build:models": "python tools/build_models.py"
+  }
+}

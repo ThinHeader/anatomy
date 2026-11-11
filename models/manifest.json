@@ -1,0 +1,72 @@
+{
+  "skeletal": {
+    "file": "skeletal.bin",
+    "bytes": 7016148,
+    "models": 249,
+    "hash": "4b6635527d26"
+  },
+  "muscular": {
+    "file": "muscular.bin",
+    "bytes": 31517716,
+    "models": 418,
+    "hash": "ee24cbd542e1"
+  },
+  "cardiovascular": {
+    "file": "cardiovascular.bin",
+    "bytes": 23419252,
+    "models": 1065,
+    "hash": "b414802459f2"
+  },
+  "nervous": {
+    "file": "nervous.bin",
+    "bytes": 8490028,
+    "models": 173,
+    "hash": "b9921b081c67"
+  },
+  "digestive": {
+    "file": "digestive.bin",
+    "bytes": 6046156,
+    "models": 152,
+    "hash": "57f15c409afb"
+  },
+  "respiratory": {
+    "file": "respiratory.bin",
+    "bytes": 2168324,
+    "models": 144,
+    "hash": "dee6ee114d7d"
+  },
+  "urinary": {
+    "file": "urinary.bin",
+    "bytes": 109332,
+    "models": 6,
+    "hash": "9ced144bed36"
+  },
+  "reproductive": {
+    "file": "reproductive.bin",
+    "bytes": 89576,
+    "models": 12,
+    "hash": "4a8a19732d18"
+  },
+  "endocrine": {
+    "file": "endocrine.bin",
+    "bytes": 85356,
+    "models": 4,
+    "hash": "16855ec49c9a"
+  },
+  "lymphatic": {
+    "file": "lymphatic.bin",
+    "bytes": 23684,
+    "models": 2,
+    "hash": "cd1afe1e96be"
+  },
+  "integumentary": {
+    "file": "integumentary.bin",
+    "bytes": 3940232,
+    "models": 9,
+    "hash": "eb3ee2cfcd23"
+  },
+  "_build": {
+    "version": "2026-11-11 09:39:54",
+    "generator": "tools/build_models.py"
+  }
+}

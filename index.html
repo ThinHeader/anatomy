@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>人体解剖学 3D 图谱 - BodyParts3D</title>
     <link rel="shortcut icon" href="favicon.svg" type="image/x-icon">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="js/three.min.js"></script>
+    <script src="js/OBJLoader.js"></script>
+    <script src="js/OrbitControls.js"></script>
     <style>
         :root { --bg-dark: #0a0a0f; --panel-bg: rgba(20, 20, 25, 0.85); --accent: #3b82f6; --text-main: #e4e4e7; --text-dim: #71717a; }
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -265,7 +265,7 @@
     <div class="ui-layer sidebar">
         <div class="sidebar-header">
             <h1 style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">🫀 人体解剖学图谱</h1>
-            <p style="font-size: 11px; color: #71717a; margin-bottom: 12px;">BodyParts3D ISA分类 · 2234个模型</p>
+            <p style="font-size: 11px; color: #71717a; margin-bottom: 12px;">BodyParts3D ISA分类 · 2234个模型<span id="build-badge" style="color:#52525b;"></span></p>
             <div class="system-tabs" id="system-tabs"></div>
             <input type="text" class="search-box" id="search-box" placeholder="搜索模型...">
         </div>
@@ -343,10 +343,101 @@
         let AnatomyData = {}, currentSystem = 'skeletal';
         let scene, camera, renderer, controls, layerSystem, raycaster, mouse, tooltip;
 
+        /* ------------------------------------------------------------------
+         * 二进制模型包加载器 (ANTB v1)
+         * 把原来「每个模型一个 obj 请求 + 文本解析」改成「每个系统一个 bin 请求」
+         * 格式见 tools/build_models.py
+         * ------------------------------------------------------------------ */
+        const ModelBundle = {
+            cache: new Map(),
+            manifestPromise: null,
+            // 读 manifest 拿到每个包的 content hash，用作 URL 版本号。
+            // 否则 /models 是 immutable 强缓存，重建模型后浏览器会一直用旧包（会出现几何拉丝的破损画面）
+            manifest() {
+                if (!this.manifestPromise) {
+                    this.manifestPromise = fetch('models/manifest.json', { cache: 'no-cache' })
+                        .then(r => (r.ok ? r.json() : {}))
+                        .then(mf => {
+                            const badge = document.getElementById('build-badge');
+                            if (badge && mf._build && mf._build.version) {
+                                badge.textContent = ' · 模型包 ' + mf._build.version.slice(5, 16);
+                            }
+                            return mf;
+                        })
+                        .catch(() => ({}));
+                }
+                return this.manifestPromise;
+            },
+            load(system) {
+                if (this.cache.has(system)) return this.cache.get(system);
+                const p = (async () => {
+                    const mf = await this.manifest();
+                    const info = mf && mf[system];
+                    const file = (info && info.file) || `${system}.bin`;
+                    const ver = info && info.hash ? `?v=${info.hash}` : '';
+                    const res = await fetch(`models/${file}${ver}`);
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const buf = await res.arrayBuffer();
+                    const dv = new DataView(buf);
+                    if (buf.byteLength < 12 || dv.getUint32(0, true) !== 0x42544E41) throw new Error('bad magic');
+                    const jsonLen = dv.getUint32(8, true);
+                    if (jsonLen <= 0 || 12 + jsonLen > buf.byteLength) throw new Error('truncated header');
+                    const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 12, jsonLen)));
+                    const dataStart = (12 + jsonLen + 3) & ~3;
+                    const index = new Map();
+                    // 完整性校验：任一模型的区间越界说明包被截断/损坏，直接回退到 obj 加载
+                    for (const m of meta) {
+                        const pEnd = dataStart + m.pOff + m.vCount * 6;
+                        const nEnd = dataStart + m.nOff + m.vCount * 3;
+                        const iEnd = dataStart + m.iOff + m.iCount * m.iType;
+                        if (pEnd > buf.byteLength || nEnd > buf.byteLength || iEnd > buf.byteLength) {
+                            throw new Error('bundle truncated: ' + m.id);
+                        }
+                        index.set(m.id, m);
+                    }
+                    return { buf, dataStart, index };
+                })();
+                p.catch(() => this.cache.delete(system));
+                this.cache.set(system, p);
+                return p;
+            },
+            toGeometry(bundle, m) {
+                const base = bundle.dataStart;
+                const q = new Int16Array(bundle.buf, base + m.pOff, m.vCount * 3);
+                const pos = new Float32Array(m.vCount * 3);
+                const cx = m.center[0], cy = m.center[1], cz = m.center[2];
+                const sx = m.scale[0], sy = m.scale[1], sz = m.scale[2];
+                for (let i = 0, j = 0; i < m.vCount; i++, j += 3) {
+                    pos[j] = cx + q[j] * sx;
+                    pos[j + 1] = cy + q[j + 1] * sy;
+                    pos[j + 2] = cz + q[j + 2] * sz;
+                }
+                const n8 = new Int8Array(bundle.buf, base + m.nOff, m.vCount * 3);
+                const nrm = new Float32Array(m.vCount * 3);
+                for (let i = 0; i < nrm.length; i++) nrm[i] = n8[i] / 127;
+
+                let idx;
+                const iOff = base + m.iOff;
+                if (m.iType === 2) idx = new Uint16Array(bundle.buf, iOff, m.iCount);
+                else if (iOff % 4 === 0) idx = new Uint32Array(bundle.buf, iOff, m.iCount);
+                else idx = new Uint32Array(bundle.buf.slice(iOff, iOff + m.iCount * 4));
+
+                const g = new THREE.BufferGeometry();
+                g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+                g.setIndex(new THREE.BufferAttribute(idx, 1));
+                return g;
+            }
+        };
+
         class LayerControlSystem {
             constructor(scene, camera, renderer, controls) {
                 this.scene = scene; this.camera = camera; this.renderer = renderer; this.controls = controls;
                 this.loadedModels = {}; SystemOrder.forEach(s => this.loadedModels[s] = new Map());
+                // 合并渲染：每个系统只有少量 chunk mesh（draw call 从 ~667 降到 ~10）
+                // systemMeshes[s] = chunk mesh 数组；loadedModels[s] 存每个部位的元数据 record（含包围盒）
+                this.systemMeshes = {}; SystemOrder.forEach(s => this.systemMeshes[s] = []);
+                this.numericIds = {}; this.numericNames = {};
                 this.layerVisibility = {}; SystemOrder.forEach(s => this.layerVisibility[s] = s === 'skeletal' || s === 'muscular');
                 this.materials = this._createMaterials();
                 this.highlightedModel = null; this.originalMaterials = new Map();
@@ -360,80 +451,235 @@
                     endocrine: {c:0x9370DB,r:0.5,m:0}, lymphatic: {c:0x90EE90,r:0.5,m:0},
                     integumentary: {c:0xF4A460,r:0.6,m:0}
                 };
-                for (const [s,c] of Object.entries(cfg)) mats[s] = new THREE.MeshStandardMaterial({color:c.c,roughness:c.r,metalness:c.m});
+                for (const [s,c] of Object.entries(cfg)) {
+                    const mat = new THREE.MeshStandardMaterial({color:c.c,roughness:c.r,metalness:c.m});
+                    // 合并渲染的高亮方案：几何体带 aId（部位编号）顶点属性，
+                    // 着色器里对比 uHighlightId 决定高亮蓝色 / 半透明变暗，无需逐 mesh 换材质
+                    mat.userData.uniforms = { uHighlightId: { value: -1 }, uDimActive: { value: 0 } };
+                    mat.onBeforeCompile = shader => {
+                        shader.uniforms.uHighlightId = mat.userData.uniforms.uHighlightId;
+                        shader.uniforms.uDimActive = mat.userData.uniforms.uDimActive;
+                        shader.vertexShader = shader.vertexShader
+                            .replace('#include <common>', '#include <common>\nattribute float aId;\nvarying float vId;')
+                            .replace('#include <begin_vertex>', '#include <begin_vertex>\nvId = aId;');
+                        shader.fragmentShader = shader.fragmentShader
+                            .replace('#include <common>', '#include <common>\nuniform float uHighlightId;\nuniform float uDimActive;\nvarying float vId;')
+                            .replace('#include <color_fragment>', [
+                                '#include <color_fragment>',
+                                'float _isHi = step(abs(vId - uHighlightId), 0.5);',
+                                'if (uDimActive > 0.5) {',
+                                '  if (_isHi > 0.5) {',
+                                '    diffuseColor.rgb = vec3(0.231, 0.510, 0.965);',   // 高亮蓝 #3b82f6
+                                '  } else {',
+                                '    diffuseColor.a *= 0.55;',                          // 其他部位半透明
+                                '  }',
+                                '}'
+                            ].join('\n'))
+                            .replace('#include <emissivemap_fragment>', [
+                                '#include <emissivemap_fragment>',
+                                'if (uDimActive > 0.5 && _isHi > 0.5) totalEmissiveRadiance += vec3(0.114, 0.306, 0.847) * 0.3;'
+                            ].join('\n'));
+                    };
+                    mat.customProgramCacheKey = () => 'anatomy-hl';
+                    mats[s] = mat;
+                }
                 return mats;
             }
             async loadSystem(system) {
                 if (!AnatomyData[system]) return;
                 const models = AnatomyData[system];
+                const pending = models.filter(m => !this.loadedModels[system].has(m.id));
+                if (!pending.length) return;
+
                 const progressBar = document.getElementById('progress-bar');
                 const progressContainer = document.getElementById('global-progress');
                 const progressText = document.getElementById('progress-text');
-                
-                // 显示进度条
+                const loadingText = document.getElementById('loading-text');
+
                 progressContainer.style.display = 'block';
                 progressText.style.display = 'block';
-                
-                let loadedInThisSession = 0;
-                const totalInSystem = models.length;
 
-                for (let i=0; i<models.length; i+=5) {
-                    const batch = models.slice(i, i+5);
-                    await Promise.all(batch.map(m => this._loadModel(system, m)));
-                    
-                    loadedInThisSession += batch.length;
-                    const percent = Math.round((loadedInThisSession / totalInSystem) * 100);
-                    
-                    // 更新进度条 UI
+                let percent = 0;
+                const total = pending.length;
+                const done = n => {
+                    percent = Math.round((n / total) * 100);
                     progressBar.style.width = percent + '%';
                     progressText.textContent = `正在载入 ${SystemConfig[system].name}: ${percent}%`;
-                    
-                    // 同步更新初始加载遮罩的文字
-                    const loadingText = document.getElementById('loading-text');
-                    if (loadingText) loadingText.textContent = `Loading ${SystemConfig[system].nameEn}: ${loadedInThisSession}/${totalInSystem}`;
+                    if (loadingText) loadingText.textContent = `Loading ${SystemConfig[system].nameEn}: ${n}/${total}`;
+                };
+
+                // 优先走单文件二进制包；失败则回退到逐个 obj 加载
+                let bundle = null;
+                try {
+                    bundle = await ModelBundle.load(system);
+                } catch (e) {
+                    console.warn('[bundle] 回退到 OBJ 加载:', system, e.message);
                 }
-                
-                // 加载完成后，延迟隐藏进度条
+
+                if (bundle) {
+                    await this._loadMerged(system, pending, bundle, done);
+                } else {
+                    let n = 0;
+                    for (let i = 0; i < pending.length; i += 5) {
+                        const batch = pending.slice(i, i + 5);
+                        await Promise.all(batch.map(m => this._loadModel(system, m)));
+                        n += batch.length;
+                        done(n);
+                    }
+                }
+
                 setTimeout(() => {
                     if (percent >= 100) {
                         progressContainer.style.display = 'none';
                         progressText.style.display = 'none';
                         progressBar.style.width = '0%';
                     }
-                }, 1000);
+                }, 800);
+
+                if (this.highlightedModel) { this._updateAllModelMaterials(); this._applyHighlightUniforms(); }
+            }
+            _numericIds(system) {
+                if (!this.numericIds[system]) {
+                    const map = new Map(), names = [];
+                    (AnatomyData[system] || []).forEach((m, i) => { map.set(m.id, i); names[i] = m.id; });
+                    this.numericIds[system] = map;
+                    this.numericNames[system] = names;
+                }
+                return this.numericIds[system];
+            }
+            // 把整个系统的所有部位合并进少量大几何体（chunk）：
+            // - 每个顶点带 aId 属性（部位编号），高亮/变暗在着色器里完成
+            // - 按身体竖直方向（raw z）分块，拾取时包围盒裁剪仍然高效
+            async _loadMerged(system, pending, bundle, done) {
+                const idMap = this._numericIds(system);
+                const items = [];
+                for (const m of pending) {
+                    const meta = bundle.index.get(m.id);
+                    if (meta) items.push({ model: m, meta });
+                }
+                if (!items.length) return;
+
+                const sorted = [...items].sort((a, b) => a.meta.center[2] - b.meta.center[2]);
+                const K = Math.max(1, Math.min(14, Math.max(3, Math.ceil(items.length / 70)), items.length));
+                const chunks = Array.from({ length: K }, () => ({ verts: 0, tris: 0, items: [] }));
+                sorted.forEach((it, i) => {
+                    const c = chunks[Math.floor(i * K / sorted.length)];
+                    c.items.push(it); c.verts += it.meta.vCount; c.tris += it.meta.iCount;
+                });
+
+                const base = bundle.dataStart;
+                let n = 0;
+                for (const chunk of chunks) {
+                    if (!chunk.items.length) continue;
+                    const pos = new Float32Array(chunk.verts * 3);
+                    const nrm = new Float32Array(chunk.verts * 3);
+                    const aid = new Float32Array(chunk.verts);
+                    const idx = chunk.verts <= 65535 ? new Uint16Array(chunk.tris) : new Uint32Array(chunk.tris);
+                    const modelEntries = [];
+                    let vBase = 0, iBase = 0;
+
+                    for (const { model, meta } of chunk.items) {
+                        const nid = idMap.get(model.id) ?? -1;
+                        const q = new Int16Array(bundle.buf, base + meta.pOff, meta.vCount * 3);
+                        const n8 = new Int8Array(bundle.buf, base + meta.nOff, meta.vCount * 3);
+                        const [cx, cy, cz] = meta.center, [sx, sy, sz] = meta.scale;
+                        // 每个部位自己的 raw 空间包围盒（供聚焦相机使用）
+                        let mnx = Infinity, mny = Infinity, mnz = Infinity, mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
+                        let lo = vBase * 3, j = 0; // lo: chunk 数组写入下标；j: 模型数据读取下标（两者必须分开）
+                        for (let i = 0; i < meta.vCount; i++, lo += 3, j += 3) {
+                            const x = cx + q[j] * sx, y = cy + q[j + 1] * sy, z = cz + q[j + 2] * sz;
+                            pos[lo] = x; pos[lo + 1] = y; pos[lo + 2] = z;
+                            nrm[lo] = n8[j] / 127; nrm[lo + 1] = n8[j + 1] / 127; nrm[lo + 2] = n8[j + 2] / 127;
+                            if (x < mnx) mnx = x; if (x > mxx) mxx = x;
+                            if (y < mny) mny = y; if (y > mxy) mxy = y;
+                            if (z < mnz) mnz = z; if (z > mxz) mxz = z;
+                        }
+                        aid.fill(nid, vBase, vBase + meta.vCount);
+
+                        const iOff = base + meta.iOff;
+                        let src;
+                        if (meta.iType === 2) src = new Uint16Array(bundle.buf, iOff, meta.iCount);
+                        else if (iOff % 4 === 0) src = new Uint32Array(bundle.buf, iOff, meta.iCount);
+                        else src = new Uint32Array(bundle.buf.slice(iOff, iOff + meta.iCount * 4));
+                        for (let i = 0; i < meta.iCount; i++) idx[iBase + i] = src[i] + vBase;
+                        iBase += meta.iCount;
+
+                        // mesh 变换 = rotX(-90°) * scale(0.1)：raw (x,y,z) -> world (x, z, -y)
+                        const wMin = [mnx * 0.1, mnz * 0.1, -mxy * 0.1], wMax = [mxx * 0.1, mxz * 0.1, -mny * 0.1];
+                        const rec = {
+                            system, id: model.id, name: model.name,
+                            worldCenter: new THREE.Vector3((wMin[0]+wMax[0])/2, (wMin[1]+wMax[1])/2, (wMin[2]+wMax[2])/2),
+                            worldSize: new THREE.Vector3(wMax[0]-wMin[0], wMax[1]-wMin[1], wMax[2]-wMin[2]),
+                        };
+                        this.loadedModels[system].set(model.id, rec);
+                        // 拾取加速：每个部位保留 local 包围盒 + 索引区间，射线先做盒测试再测三角形
+                        modelEntries.push({
+                            rec,
+                            box: new THREE.Box3(new THREE.Vector3(mnx, mny, mnz), new THREE.Vector3(mxx, mxy, mxz)),
+                            iStart: iBase - meta.iCount,
+                            iCount: meta.iCount,
+                        });
+                        vBase += meta.vCount;
+                    }
+
+                    const g = new THREE.BufferGeometry();
+                    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+                    g.setAttribute('aId', new THREE.BufferAttribute(aid, 1));
+                    g.setIndex(new THREE.BufferAttribute(idx, 1));
+                    g.computeBoundingSphere(); g.computeBoundingBox();
+                    const mesh = new THREE.Mesh(g, this.materials[system]);
+                    mesh.scale.set(0.1, 0.1, 0.1);
+                    mesh.rotation.x = -Math.PI / 2;
+                    mesh.visible = this.layerVisibility[system];
+                    mesh.userData = { chunk: true, system, models: modelEntries };
+                    this.scene.add(mesh);
+                    this.systemMeshes[system].push(mesh);
+
+                    n += chunk.items.length;
+                    done(Math.min(n, pending.length));
+                    // 让出主线程：用 setTimeout 而不是 requestAnimationFrame，
+                    // 否则渲染卡顿时加载会被拖慢
+                    await new Promise(r => setTimeout(r, 0));
+                }
             }
             _loadModel(system, model) {
                 if (this.loadedModels[system].has(model.id)) return Promise.resolve();
                 return new Promise(r => {
                     new THREE.OBJLoader().load(`isa_BP3D_4.0_obj_99/${model.id}.obj`, obj => {
-                        const material = this.materials[system].clone();
-                        obj.traverse(c => { 
-                            if (c.isMesh) { 
-                                c.material = material; 
+                        const material = this.materials[system];
+                        const nid = this._numericIds(system).get(model.id) ?? -1;
+                        obj.traverse(c => {
+                            if (c.isMesh) {
+                                c.material = material;
+                                // 回退路径没有打包器的 aId，补一个常量属性保证着色器行为一致
+                                c.geometry.setAttribute('aId', new THREE.BufferAttribute(new Float32Array(c.geometry.attributes.position.count).fill(nid), 1));
                                 c.userData = {system, id: model.id, name: model.name};
-                                // 保存基础材质用于后续高亮恢复
                                 c.userData.baseMaterial = material;
-                            } 
+                            }
                         });
-                        obj.scale.set(0.1,0.1,0.1); obj.rotation.x = -Math.PI/2; 
+                        obj.scale.set(0.1,0.1,0.1); obj.rotation.x = -Math.PI/2;
                         obj.visible = this.layerVisibility[system];
                         this.scene.add(obj); this.loadedModels[system].set(model.id, obj); r(obj);
                     }, null, () => r(null));
                 });
             }
-            toggleLayer(system, visible) { 
-                this.layerVisibility[system] = visible; 
-                // 强制遍历所有已加载的模型，设置visible
-                this.loadedModels[system].forEach(m => { 
+            toggleLayer(system, visible) {
+                this.layerVisibility[system] = visible;
+                // 合并路径：整组 chunk mesh 一起显隐
+                (this.systemMeshes[system] || []).forEach(mesh => { mesh.visible = visible; });
+                // OBJ 回退路径：逐模型显隐
+                this.loadedModels[system].forEach(m => {
+                    if (!m || !m.isObject3D) return;
                     m.visible = visible;
-                    // 确保所有子mesh也设置visible
                     m.traverse(c => { c.visible = visible; });
-                }); 
+                });
                 if (visible) {
                     return this.loadSystem(system).then(() => {
                         // 加载完成后，如果有高亮状态，更新材质
                         if (this.highlightedModel) {
                             this._updateAllModelMaterials();
+                            this._applyHighlightUniforms();
                         }
                     });
                 }
@@ -452,11 +698,25 @@
                 
                 // 更新所有模型的材质状态
                 this._updateAllModelMaterials();
+                this._applyHighlightUniforms();
+            }
+            _applyHighlightUniforms() {
+                const active = !!this.highlightedModel;
+                const idMap = active ? this.numericIds[this.highlightedSystem] : null;
+                const nid = idMap ? (idMap.get(this.highlightedModelId) ?? -1) : -1;
+                SystemOrder.forEach(s => {
+                    const mat = this.materials[s];
+                    mat.userData.uniforms.uHighlightId.value = (active && s === this.highlightedSystem) ? nid : -1;
+                    mat.userData.uniforms.uDimActive.value = active ? 1 : 0;
+                    // 高亮期间其他部位要半透明，需要开启混合
+                    if (mat.transparent !== active) { mat.transparent = active; mat.needsUpdate = true; }
+                });
             }
             _updateAllModelMaterials() {
                 SystemOrder.forEach(s => {
                     if (!this.layerVisibility[s]) return;
                     this.loadedModels[s].forEach((obj, modelId) => {
+                        if (!obj || !obj.isObject3D) return; // 合并路径的 record 走着色器高亮，跳过
                         const isHighlighted = (s === this.highlightedSystem && modelId === this.highlightedModelId);
                         const isOther = this.highlightedModel && !isHighlighted;
                         
@@ -481,13 +741,17 @@
                                 }
                                 c.material = c.userData.highlightMat;
                             } else if (isOther) {
-                                // 其他模型：半透明（基于基础材质）
-                                if (!c.userData.dimMat) {
-                                    c.userData.dimMat = c.userData.baseMaterial.clone();
-                                    c.userData.dimMat.transparent = true;
-                                    c.userData.dimMat.opacity = 0.55;
+                                // 其他模型：半透明（同一系统共用一个材质，避免上百个材质实例）
+                                if (!this._dimMaterials) this._dimMaterials = {};
+                                let dim = this._dimMaterials[s];
+                                if (!dim) {
+                                    dim = c.userData.baseMaterial.clone();
+                                    dim.transparent = true;
+                                    dim.opacity = 0.55;
+                                    this._dimMaterials[s] = dim;
                                 }
-                                c.material = c.userData.dimMat;
+                                c.userData.dimMat = dim;
+                                c.material = dim;
                             } else {
                                 // 无高亮状态：恢复基础材质
                                 c.material = c.userData.baseMaterial;
@@ -503,17 +767,28 @@
                 this.highlightedSystem = null;
                 // 恢复所有材质
                 this._updateAllModelMaterials();
+                this._applyHighlightUniforms();
             }
             focusOnModel(id, system) {
-                const model = this.loadedModels[system]?.get(id);
-                if (!model) { 
+                const rec = this.loadedModels[system]?.get(id);
+                if (!rec) {
                     // 模型未加载，先开启图层加载模型，然后重试
                     this.toggleLayer(system, true).then(() => {
                         this.focusOnModel(id, system);
                     });
-                    return; 
+                    return;
                 }
-                const box = new THREE.Box3().setFromObject(model), center = box.getCenter(new THREE.Vector3()), dist = Math.max(...box.getSize(new THREE.Vector3()).toArray()) * 5;
+                let center, size;
+                if (rec.isObject3D) {
+                    const box = new THREE.Box3().setFromObject(rec);
+                    center = box.getCenter(new THREE.Vector3()); size = box.getSize(new THREE.Vector3());
+                } else {
+                    center = rec.worldCenter.clone(); size = rec.worldSize.clone();
+                }
+                // 相机距离：按部位尺寸的 5 倍，但要夹在合理区间内。
+                // 太小会钻进肌肉/皮肤内部，只剩内部暗面和拉丝，完全看不清
+                let dist = Math.max(size.x, size.y, size.z) * 5;
+                dist = Math.min(Math.max(dist, 30), 220);
                 const endPos = new THREE.Vector3(center.x+dist, center.y+dist*0.5, center.z+dist), startPos = this.camera.position.clone();
                 let t = 0; const animate = () => { if (t >= 1) return; t += 0.05; this.camera.position.lerpVectors(startPos, endPos, t*(2-t)); this.controls.target.lerp(center, 0.1); this.controls.update(); requestAnimationFrame(animate); };
                 animate(); 
@@ -523,11 +798,66 @@
                 }
             }
             raycast(mouse) {
-                raycaster.setFromCamera(mouse, this.camera); const visibleObjects = [];
-                SystemOrder.forEach(s => { if (this.layerVisibility[s]) this.loadedModels[s].forEach(obj => { if (obj.visible) visibleObjects.push(obj); }); });
-                const intersects = raycaster.intersectObjects(visibleObjects, true);
-                if (intersects.length > 0) { let t = intersects[0].object; while (t.parent && !t.userData.id) t = t.parent; return t.userData; }
+                raycaster.setFromCamera(mouse, this.camera);
+                const ray = raycaster.ray;
+                const inv = this._inv || (this._inv = new THREE.Matrix4());
+                const localRay = this._localRay || (this._localRay = new THREE.Ray());
+                let best = null, bestD = Infinity;
+                const fallback = [];
+                SystemOrder.forEach(s => {
+                    if (!this.layerVisibility[s]) return;
+                    (this.systemMeshes[s] || []).forEach(mesh => {
+                        if (!mesh.visible) return;
+                        // 世界射线转到 chunk 局部空间（mesh 带 0.1 缩放 + 旋转），
+                        // 先测 chunk 包围盒，再逐个部位盒测试，只有命中的部位才测三角形
+                        inv.copy(mesh.matrixWorld).invert();
+                        localRay.copy(ray).applyMatrix4(inv);
+                        if (!localRay.intersectsBox(mesh.geometry.boundingBox)) return;
+                        for (const e of mesh.userData.models) {
+                            if (!localRay.intersectsBox(e.box)) continue;
+                            const d = this._rayModel(localRay, mesh.geometry, e);
+                            if (d !== null && d < bestD) { bestD = d; best = e.rec; }
+                        }
+                    });
+                    // OBJ 回退路径：逐模型
+                    this.loadedModels[s].forEach(o => { if (o && o.isObject3D && o.visible) fallback.push(o); });
+                });
+                if (best) return best;
+                if (fallback.length) {
+                    const hits = raycaster.intersectObjects(fallback, true);
+                    if (hits.length) {
+                        let t = hits[0].object; while (t.parent && !t.userData.id) t = t.parent; return t.userData;
+                    }
+                }
                 return null;
+            }
+            // 单部位三角形求交（局部空间，Möller–Trumbore），返回最近命中距离
+            _rayModel(ray, geometry, e) {
+                const pos = geometry.attributes.position.array;
+                const idx = geometry.index.array;
+                const ox = ray.origin.x, oy = ray.origin.y, oz = ray.origin.z;
+                const dx = ray.direction.x, dy = ray.direction.y, dz = ray.direction.z;
+                let best = null;
+                const end = Math.min(e.iStart + e.iCount, idx.length);
+                for (let i = e.iStart; i < end; i += 3) {
+                    const a = idx[i] * 3, b = idx[i + 1] * 3, c = idx[i + 2] * 3;
+                    const ax = pos[a], ay = pos[a + 1], az = pos[a + 2];
+                    const e1x = pos[b] - ax, e1y = pos[b + 1] - ay, e1z = pos[b + 2] - az;
+                    const e2x = pos[c] - ax, e2y = pos[c + 1] - ay, e2z = pos[c + 2] - az;
+                    const px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
+                    const det = e1x * px + e1y * py + e1z * pz;
+                    if (det > -1e-9 && det < 1e-9) continue;
+                    const invDet = 1 / det;
+                    const tx = ox - ax, ty = oy - ay, tz = oz - az;
+                    const u = (tx * px + ty * py + tz * pz) * invDet;
+                    if (u < 0 || u > 1) continue;
+                    const qx = ty * e1z - tz * e1y, qy = tz * e1x - tx * e1z, qz = tx * e1y - ty * e1x;
+                    const v = (dx * qx + dy * qy + dz * qz) * invDet;
+                    if (v < 0 || u + v > 1) continue;
+                    const t = (e2x * qx + e2y * qy + e2z * qz) * invDet;
+                    if (t > 1e-6 && (best === null || t < best)) best = t;
+                }
+                return best;
             }
         }
 
@@ -546,15 +876,17 @@
             }
             
             initUI(); init3D(); setupInteraction(); 
-            // 默认加载骨骼和肌肉系统
-            layerSystem.loadSystem('skeletal'); 
+            // 默认加载骨骼和肌肉系统：骨骼先到位就撤掉遮罩，肌肉在后台继续
+            layerSystem.loadSystem('skeletal').then(() => {
+                const overlay = document.getElementById('loading');
+                if (overlay) {
+                    overlay.style.opacity = '0';
+                    setTimeout(() => overlay.style.display = 'none', 400);
+                }
+            });
             layerSystem.loadSystem('muscular');
-            
+
             updateModelList();
-            setTimeout(() => { 
-                document.getElementById('loading').style.opacity = '0'; 
-                setTimeout(() => document.getElementById('loading').style.display = 'none', 500); 
-            }, 2000);
         }
 
         function initUI() {
